@@ -217,7 +217,7 @@ class InstantXControlNetFlux(Flux):
         vec.add_(self.vector_in(y))
 
         if self.union:
-            if not controlnet_mode:
+            if controlnet_mode is None:
                 raise ValueError('using union-controlnet, but controlnet_mode is not a list or is empty')
             controlnet_mode = torch.tensor([[controlnet_mode]], device=self.device)
             emb_controlnet_mode = self.controlnet_mode_embedder(controlnet_mode).to(self.dtype)
