@@ -4,10 +4,11 @@ import logging
 import comfy
 import torch
 from .controlnet.controlnet_instantx import InstantXControlNetFlux
+from .controlnet.controlnet_instantx_format2 import InstantXControlNetFluxFormat2
 from comfy.controlnet import ControlNet, controlnet_load_state_dict
 from nodes import ControlNetApplyAdvanced
 
-def load_controlnet_flux_instantx(sd):
+def load_controlnet_flux_instantx(sd, controlnet_class, weight_dtype):
     keys_to_keep = [
         "controlnet_",
         "single_transformer_blocks",
@@ -41,19 +42,31 @@ def load_controlnet_flux_instantx(sd):
     }
 
     device=mm.get_torch_device()
-    dtype=torch.bfloat16
-    control_model = InstantXControlNetFlux(operations=torch.nn, device=device, dtype=dtype, **config)
+
+    if weight_dtype == "fp8_e4m3fn":
+        dtype=torch.float8_e4m3fn
+        operations = comfy.ops.manual_cast
+    elif weight_dtype == "fp8_e5m2":
+        dtype=torch.float8_e5m2
+        operations = comfy.ops.manual_cast
+    else:
+        dtype=torch.bfloat16
+        operations = comfy.ops.disable_weight_init
+    
+    control_model = controlnet_class(operations=operations, device=device, dtype=dtype, **config)
     control_model = controlnet_load_state_dict(control_model, new_sd)
     extra_conds = ['y', 'guidance', 'control_type']
     latent_format = comfy.latent_formats.SD3()
     # TODO check manual cast dtype
-    control = ControlNet(control_model, compression_ratio=1, load_device=device, manual_cast_dtype=dtype, extra_conds=extra_conds, latent_format=latent_format)
+    control = ControlNet(control_model, compression_ratio=1, load_device=device, manual_cast_dtype=torch.bfloat16, extra_conds=extra_conds, latent_format=latent_format)
     return control
 
-def load_controlnet(full_path):
+def load_controlnet(full_path, weight_dtype):
     controlnet_data = comfy.utils.load_torch_file(full_path, safe_load=True)
     if "controlnet_mode_embedder.fc.weight" in controlnet_data:
-        return load_controlnet_flux_instantx(controlnet_data)
+        return load_controlnet_flux_instantx(controlnet_data, InstantXControlNetFlux, weight_dtype)
+    if "controlnet_mode_embedder.weight" in controlnet_data:
+        return load_controlnet_flux_instantx(controlnet_data, InstantXControlNetFluxFormat2, weight_dtype)
     assert False, f"Only InstantX union controlnet supported. Could not find key 'controlnet_mode_embedder.fc.weight' in {full_path}"
 
 INSTANTX_UNION_CONTROLNET_TYPES = {
@@ -72,7 +85,8 @@ class InstantXFluxUnionControlNetLoader:
         return {
             "required": {
                 "control_net_name": (folder_paths.get_filename_list("controlnet"),),
-                "type": (list(INSTANTX_UNION_CONTROLNET_TYPES.keys()),)
+                "type": (list(INSTANTX_UNION_CONTROLNET_TYPES.keys()),),
+                #"weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"],)
             }
         }
     
@@ -80,9 +94,9 @@ class InstantXFluxUnionControlNetLoader:
     FUNCTION = "load_controlnet"
     CATEGORY = "loaders"
 
-    def load_controlnet(self, control_net_name, type):
+    def load_controlnet(self, control_net_name, type, weight_dtype="default"):
         controlnet_path = folder_paths.get_full_path("controlnet", control_net_name)
-        controlnet = load_controlnet(controlnet_path)
+        controlnet = load_controlnet(controlnet_path, weight_dtype)
 
         type_number = INSTANTX_UNION_CONTROLNET_TYPES.get(type, -1)
         controlnet.set_extra_arg("control_type", type_number)
