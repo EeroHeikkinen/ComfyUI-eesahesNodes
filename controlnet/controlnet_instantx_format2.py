@@ -43,20 +43,6 @@ else:
         def forward(self, input):
             return F.layer_norm(input, self.dim, self.weight, self.bias, self.eps)
 
-class FluxUnionControlNetModeEmbedder(nn.Module):
-    def __init__(self, num_mode, out_channels):
-        super().__init__()
-        self.mode_embber = nn.Embedding(num_mode, out_channels)
-        self.norm = nn.LayerNorm(out_channels, eps=1e-6)
-        self.fc = nn.Linear(out_channels, out_channels)
-    
-    def forward(self, x):
-        x_emb = self.mode_embber(x)
-        x_emb = self.norm(x_emb)
-        x_emb = self.fc(x_emb)
-        x_emb = x_emb[:, 0]
-        return x_emb
-
 def zero_module(module):
     for p in module.parameters():
         nn.init.zeros_(p)
@@ -69,50 +55,6 @@ def apply_rope(xq, xk, freqs_cis):
     xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
     xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
-
-
-
-class FluxUnionControlNetInputEmbedder(nn.Module):
-    def __init__(self, in_channels, out_channels, num_attention_heads=24, mlp_ratio=4.0, attention_head_dim=128, dtype=None, device=None, operations=None, depth=2):
-        super().__init__()
-        self.x_embedder = nn.Sequential(nn.LayerNorm(in_channels), nn.Linear(in_channels, out_channels))
-        self.norm = AdaLayerNormContinuous(out_channels, out_channels, elementwise_affine=False, eps=1e-6)
-        self.fc = nn.Linear(out_channels, out_channels)
-        self.emb_embedder = nn.Sequential(nn.LayerNorm(out_channels), nn.Linear(out_channels, out_channels))
-
-        """ self.single_blocks = nn.ModuleList(
-            [
-                SingleStreamBlock(
-                    out_channels, num_attention_heads, dtype=dtype, device=device, operations=operations
-                )
-                for i in range(2)
-            ]
-        ) """
-        self.single_transformer_blocks = nn.ModuleList(
-            [
-                FluxSingleTransformerBlock(
-                    dim=out_channels,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                )
-                for i in range(depth)
-            ]
-        )
-
-        self.out = zero_module(nn.Linear(out_channels, out_channels))
-
-    def forward(self, x, mode_emb):
-        mode_token = self.emb_embedder(mode_emb)[:, None]
-        x_emb = self.fc(self.norm(self.x_embedder(x), mode_emb))
-        hidden_states = torch.cat([mode_token, x_emb], dim=1)
-        for index_block, block in enumerate(self.single_transformer_blocks):
-            hidden_states = block(
-                hidden_states=hidden_states,
-                temb=mode_emb,
-            )
-        hidden_states = self.out(hidden_states)
-        res = hidden_states[:, 1:]
-        return res
 
 class InstantXControlNetFluxFormat2(Flux):
     def __init__(self, image_model=None, dtype=None, device=None, operations=None, joint_attention_dim=4096, **kwargs):
@@ -161,11 +103,8 @@ class InstantXControlNetFluxFormat2(Flux):
         self.union = True #num_mode is not None
         num_mode = 10
         if self.union:
-            self.controlnet_mode_embedder = zero_module(FluxUnionControlNetModeEmbedder(num_mode, self.hidden_size)).to(device=device, dtype=dtype)
-            self.controlnet_x_embedder = FluxUnionControlNetInputEmbedder(self.in_channels, self.hidden_size, operations=operations, depth=depth_single_blocks_controlnet).to(device=device, dtype=dtype)
-            self.controlnet_mode_token_embedder = nn.Sequential(nn.LayerNorm(self.hidden_size, eps=1e-6), nn.Linear(self.hidden_size, self.hidden_size)).to(device=device, dtype=dtype)
-        else:
-            self.controlnet_x_embedder = zero_module(torch.nn.Linear(self.in_channels, self.hidden_size)).to(device=device, dtype=dtype)
+            self.controlnet_mode_embedder = nn.Embedding(num_mode, self.hidden_size)
+        self.controlnet_x_embedder = zero_module(operations.Linear(self.in_channels, self.hidden_size).to(device=device, dtype=dtype))
         self.gradient_checkpointing = False
         
     @staticmethod
@@ -176,22 +115,6 @@ class InstantXControlNetFluxFormat2(Flux):
         latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
 
         return latents
-
-    def set_hint_latents(self, hint_latents):
-        vae_shift_factor = 0.1159
-        vae_scaling_factor = 0.3611
-        num_channels_latents = self.in_channels // 4
-        hint_latents = (hint_latents - vae_shift_factor) * vae_scaling_factor
-
-        height, width = hint_latents.shape[2:]
-        hint_latents = self._pack_latents(
-            hint_latents,
-            hint_latents.shape[0],
-            num_channels_latents,
-            height,
-            width,
-        )
-        self.hint_latents = hint_latents.to(device=self.device, dtype=self.dtype)
 
     def forward_orig(
         self,
@@ -216,26 +139,22 @@ class InstantXControlNetFluxFormat2(Flux):
             vec.add_(self.guidance_in(timestep_embedding(guidance, 256).to(self.dtype)))
         vec.add_(self.vector_in(y))
 
-        if self.union:
-            if controlnet_mode is None:
-                raise ValueError('using union-controlnet, but controlnet_mode is not a list or is empty')
-            controlnet_mode = torch.tensor([[controlnet_mode]], device=self.device)
-            emb_controlnet_mode = self.controlnet_mode_embedder(controlnet_mode).to(self.dtype)
-            vec = vec + emb_controlnet_mode
-            img = img + self.controlnet_x_embedder(controlnet_cond, emb_controlnet_mode)
-        else:
-            img = img + self.controlnet_x_embedder(controlnet_cond)
-
         txt = self.txt_in(txt)
 
         if self.union:
-            token_controlnet_mode = self.controlnet_mode_token_embedder(emb_controlnet_mode)[:, None]
-            token_controlnet_mode = token_controlnet_mode.expand(txt.size(0), -1, -1)
-            txt = torch.cat([token_controlnet_mode, txt], dim=1)
+            if controlnet_mode is None:
+                raise ValueError('using union-controlnet, but controlnet_mode is not a list or is empty')
+            controlnet_mode = torch.tensor(controlnet_mode).to(self.device, dtype=torch.long)
+            controlnet_mode = controlnet_mode.reshape([-1, 1])
+            emb_controlnet_mode = self.controlnet_mode_embedder(controlnet_mode).to(self.dtype)
+            txt = torch.cat([emb_controlnet_mode, txt], dim=1)
             txt_ids = torch.cat([txt_ids[:, :1], txt_ids], dim=1)
 
+        img = img + self.controlnet_x_embedder(controlnet_cond)
+
+        txt_ids = txt_ids.expand(img_ids.size(0), -1, -1) 
         ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe = self.pe_embedder(ids).to(dtype=self.dtype, device=self.device)
+        pe = self.pe_embedder(ids)
 
         block_res_samples = ()
         for block in self.transformer_blocks:
