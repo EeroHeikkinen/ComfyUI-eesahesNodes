@@ -63,10 +63,10 @@ def load_controlnet_flux_instantx(sd, controlnet_class, weight_dtype):
 
 def load_controlnet(full_path, weight_dtype):
     controlnet_data = comfy.utils.load_torch_file(full_path, safe_load=True)
-    if "controlnet_mode_embedder.fc.weight" in controlnet_data:
-        return load_controlnet_flux_instantx(controlnet_data, InstantXControlNetFlux, weight_dtype)
     if "controlnet_mode_embedder.weight" in controlnet_data:
         return load_controlnet_flux_instantx(controlnet_data, InstantXControlNetFluxFormat2, weight_dtype)
+    if "controlnet_mode_embedder.fc.weight" in controlnet_data:
+        return load_controlnet_flux_instantx(controlnet_data, InstantXControlNetFlux, weight_dtype)
     assert False, f"Only InstantX union controlnet supported. Could not find key 'controlnet_mode_embedder.fc.weight' in {full_path}"
 
 INSTANTX_UNION_CONTROLNET_TYPES = {
